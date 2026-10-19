@@ -400,9 +400,64 @@ static void _starpu_worker_set_status_wakeup(int workerid)
 }
 
 #if !defined(STARPU_SIMGRID)
+#ifdef STARPU_LITHE
+#include <sys/timerfd.h>
+#include <sys/epoll.h>
+extern int lithe_can_block(void) __attribute__((weak));
+extern void lithe_context_yield(void) __attribute__((weak));
+extern long lithe_fork_join_current_hartless_runnable(void) __attribute__((weak));
+extern int parlib_reactor_wait(int fd, uint32_t events, int timeout_ms) __attribute__((weak));
+/* StarPU keeps the last awake worker of a scheduling context polling. Under Lithe a
+ * yielding poller stays runnable and takes its turn on every hart that other runtimes
+ * need (StarPU + OpenMP in one process: no better than stock with passive OpenMP). When a
+ * runnable context has no hart, park the poller briefly instead: a timerfd (STARPU_LITHE_NAP_US, default 50; 0 = yield only) waited on
+ * through parlib's reactor. Task pickup is unaffected -- submission wakes the sleeping
+ * workers through their condition variables. */
+static __thread int _starpu_lithe_tfd = -1;
+static int _starpu_lithe_nap(void)
+{
+	if (!parlib_reactor_wait || !lithe_fork_join_current_hartless_runnable
+	    || lithe_fork_join_current_hartless_runnable() <= 0)
+		return 0;
+	if (_starpu_lithe_tfd < 0)
+		_starpu_lithe_tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+	if (_starpu_lithe_tfd < 0)
+		return 0;
+	static long nap_ns = -1;
+	if (nap_ns < 0)
+	{
+		const char *e = getenv("STARPU_LITHE_NAP_US");
+		nap_ns = (e && *e) ? atol(e) * 1000 : 50000; /* see the sweep in docs/PLAN-alt-runtimes.md */
+		if (nap_ns < 0) nap_ns = 0;
+	}
+	if (nap_ns == 0)
+		return 0;
+	struct itimerspec it = { { 0, 0 }, { 0, nap_ns } };
+	if (timerfd_settime(_starpu_lithe_tfd, 0, &it, NULL) != 0)
+		return 0;
+	if (parlib_reactor_wait(_starpu_lithe_tfd, EPOLLIN, -1) < 0)
+		return 0;
+	uint64_t n;
+	(void) read(_starpu_lithe_tfd, &n, sizeof(n));
+	return 1;
+}
+#endif
 static void _starpu_exponential_backoff(struct _starpu_worker *worker)
 {
 	int delay = worker->spinning_backoff;
+#ifdef STARPU_LITHE
+	/* Lithe port, same hook as nOS-V's nosv_yield below: an idle worker that is a Lithe
+	 * context gives its hart away instead of spinning on it. Without this the workers
+	 * held every hart polling for tasks that the submitting context, left without a
+	 * hart, could never submit (livelock, gdb 2026-10-19). One yield per call: the
+	 * caller loops. */
+	if (lithe_can_block && lithe_context_yield && lithe_can_block() && !getenv("STARPU_LITHE_DISABLE"))
+	{
+		if (!_starpu_lithe_nap())
+			lithe_context_yield();
+		return;
+	}
+#endif
 
 	if (worker->spinning_backoff < worker->config->conf.driver_spinning_backoff_max)
 		worker->spinning_backoff<<=1;

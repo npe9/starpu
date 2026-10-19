@@ -1174,9 +1174,22 @@ int starpu_sem_getvalue(starpu_sem_t *sem, int *sval)
 
 #elif !defined(_MSC_VER) || defined(BUILDING_STARPU) /* !STARPU_SIMGRID */
 
+#ifdef STARPU_LITHE
+extern int lithe_can_block(void) __attribute__((weak));
+extern void lithe_context_yield(void) __attribute__((weak));
+#endif
 int starpu_sem_wait(starpu_sem_t *sem)
 {
 	int ret;
+#ifdef STARPU_LITHE
+	/* Lithe port: a context must not block its hart in sem_wait; try and yield. */
+	if (lithe_can_block && lithe_context_yield && lithe_can_block() && !getenv("STARPU_LITHE_DISABLE"))
+	{
+		while ((ret = sem_trywait(sem)) == -1 && (errno == EAGAIN || errno == EINTR))
+			lithe_context_yield();
+		return ret;
+	}
+#endif
 	while((ret = sem_wait(sem)) == -1 && errno == EINTR)
 		;
 
@@ -1193,3 +1206,210 @@ int starpu_sem_trywait(starpu_sem_t *sem)
 }
 
 #endif
+
+#if defined(STARPU_LITHE) && !defined(STARPU_FXT_LOCK_TRACES) && !defined(STARPU_SIMGRID) && !defined(_MSC_VER)
+/* ---------------------------------------------------------------------------
+ * Lithe port (lithe-docker, 2026-10-19). StarPU's workers become Lithe fork-join
+ * contexts in the caller's scheduler (daemon: they live as long as StarPU), and
+ * every StarPU wait -- mutex, rwlock, condition variable, semaphore -- lets the
+ * hart run other contexts instead of blocking it in the kernel: a Lithe context
+ * tries and yields, or parks on liblithe's futex; anything else (a kernel thread,
+ * a context that cannot block) uses pthreads unchanged. The pthread types stay
+ * (static initialisers); condition variables get a side table of sequence words
+ * keyed by address. All Lithe symbols are weak: without liblithe, or with
+ * STARPU_LITHE_DISABLE=1, this is stock StarPU. Set STARPU_WORKERS_NOBIND=1 under
+ * Lithe so workers do not pin the hart threads.
+ * ------------------------------------------------------------------------- */
+#include <sched.h>
+#include <errno.h>
+#include <time.h>
+typedef struct lithe_sched lithe_sched_t;
+typedef struct lithe_fork_join_sched lithe_fork_join_sched_t;
+typedef struct lithe_fork_join_context lithe_fork_join_context_t;
+extern lithe_sched_t *lithe_sched_current(void) __attribute__((weak));
+extern int lithe_can_block(void) __attribute__((weak));
+extern void lithe_context_yield(void) __attribute__((weak));
+extern lithe_fork_join_sched_t *lithe_ensure_root_fork_join_sched(void) __attribute__((weak));
+extern lithe_fork_join_context_t *lithe_fork_join_context_create(lithe_fork_join_sched_t *, size_t, void (*)(void *), void *) __attribute__((weak));
+extern void lithe_fork_join_context_set_daemon(lithe_fork_join_context_t *) __attribute__((weak));
+extern const char lithe_fork_join_sched_funcs[] __attribute__((weak));
+extern int starpu_lithe_futex_wait_(int *, int) __asm__("futex_wait") __attribute__((weak));
+extern int starpu_lithe_futex_wake_some_(int *, int) __asm__("futex_wake_some") __attribute__((weak));
+
+static int _starpu_lithe_on(void)
+{
+	static int on = -1;
+	if (on < 0)
+	{
+		const char *d = getenv("STARPU_LITHE_DISABLE");
+		on = !(d && d[0] == '1') && lithe_can_block && lithe_context_yield && lithe_sched_current
+		     && lithe_fork_join_context_create && starpu_lithe_futex_wait_ && starpu_lithe_futex_wake_some_;
+	}
+	return on;
+}
+/* The caller is a Lithe context that may yield or park. */
+static int _starpu_lithe_coop(void)
+{
+	return _starpu_lithe_on() && lithe_can_block();
+}
+
+/* ---- threads ---- */
+struct _starpu_lithe_thr { void *(*fn)(void *); void *arg; void *ret; int done; int refs; };
+static int _starpu_lithe_handle(pthread_t t) { return ((uintptr_t) t & 1u) != 0; }
+static struct _starpu_lithe_thr *_starpu_lithe_rec(pthread_t t) { return (struct _starpu_lithe_thr *) ((uintptr_t) t & ~(uintptr_t) 1); }
+static void _starpu_lithe_drop(struct _starpu_lithe_thr *r) { if (__atomic_sub_fetch(&r->refs, 1, __ATOMIC_ACQ_REL) == 0) free(r); }
+static void _starpu_lithe_start(void *x)
+{
+	struct _starpu_lithe_thr *r = x;
+	r->ret = r->fn(r->arg);
+	__atomic_store_n(&r->done, 1, __ATOMIC_RELEASE);
+	starpu_lithe_futex_wake_some_(&r->done, 1 << 30);
+	_starpu_lithe_drop(r);
+}
+static lithe_fork_join_sched_t *_starpu_lithe_worker_sched(void)
+{
+	lithe_sched_t *cur = lithe_sched_current();
+	if (cur && lithe_fork_join_sched_funcs && *(const void *const *) cur == (const void *) lithe_fork_join_sched_funcs)
+		return (lithe_fork_join_sched_t *) cur;
+	return lithe_ensure_root_fork_join_sched ? lithe_ensure_root_fork_join_sched() : NULL;
+}
+int starpu_pthread_create(starpu_pthread_t *thread, const starpu_pthread_attr_t *attr, void *(*start_routine)(void *), void *arg)
+{
+	if (_starpu_lithe_on() && lithe_sched_current() != NULL)
+	{
+		lithe_fork_join_sched_t *s = _starpu_lithe_worker_sched();
+		struct _starpu_lithe_thr *r = calloc(1, sizeof(*r));
+		size_t ss = 4u << 20;
+		if (attr) { size_t a = 0; if (pthread_attr_getstacksize(attr, &a) == 0 && a > ss) ss = a; }
+		if (s && r)
+		{
+			r->fn = start_routine; r->arg = arg; r->refs = 2;
+			lithe_fork_join_context_t *c = lithe_fork_join_context_create(s, ss, _starpu_lithe_start, r);
+			if (c)
+			{
+				if (lithe_fork_join_context_set_daemon) lithe_fork_join_context_set_daemon(c);
+				*thread = (pthread_t) ((uintptr_t) r | 1u);
+				return 0;
+			}
+		}
+		free(r);
+	}
+	return pthread_create(thread, attr, start_routine, arg);
+}
+int starpu_pthread_join(starpu_pthread_t thread, void **retval)
+{
+	if (!_starpu_lithe_handle(thread))
+		return pthread_join(thread, retval);
+	struct _starpu_lithe_thr *r = _starpu_lithe_rec(thread);
+	while (!__atomic_load_n(&r->done, __ATOMIC_ACQUIRE))
+	{
+		if (_starpu_lithe_coop()) starpu_lithe_futex_wait_(&r->done, 0);
+		else sched_yield();
+	}
+	if (retval) *retval = r->ret;
+	_starpu_lithe_drop(r);
+	return 0;
+}
+int starpu_pthread_detach(starpu_pthread_t thread)
+{
+	if (!_starpu_lithe_handle(thread))
+		return pthread_detach(thread);
+	_starpu_lithe_drop(_starpu_lithe_rec(thread));
+	return 0;
+}
+
+/* ---- mutexes and rwlocks: try, then yield the context ---- */
+int starpu_pthread_mutex_lock(starpu_pthread_mutex_t *mutex)
+{
+	if (!_starpu_lithe_coop())
+		return pthread_mutex_lock(mutex);
+	int r;
+	while ((r = pthread_mutex_trylock(mutex)) == EBUSY)
+		lithe_context_yield();
+	return r;
+}
+int starpu_pthread_mutex_unlock(starpu_pthread_mutex_t *mutex) { return pthread_mutex_unlock(mutex); }
+int starpu_pthread_mutex_trylock(starpu_pthread_mutex_t *mutex) { return pthread_mutex_trylock(mutex); }
+int starpu_pthread_rwlock_rdlock(starpu_pthread_rwlock_t *l)
+{
+	if (!_starpu_lithe_coop()) return pthread_rwlock_rdlock(l);
+	int r; while ((r = pthread_rwlock_tryrdlock(l)) == EBUSY) lithe_context_yield(); return r;
+}
+int starpu_pthread_rwlock_wrlock(starpu_pthread_rwlock_t *l)
+{
+	if (!_starpu_lithe_coop()) return pthread_rwlock_wrlock(l);
+	int r; while ((r = pthread_rwlock_trywrlock(l)) == EBUSY) lithe_context_yield(); return r;
+}
+int starpu_pthread_rwlock_tryrdlock(starpu_pthread_rwlock_t *l) { return pthread_rwlock_tryrdlock(l); }
+int starpu_pthread_rwlock_trywrlock(starpu_pthread_rwlock_t *l) { return pthread_rwlock_trywrlock(l); }
+int starpu_pthread_rwlock_unlock(starpu_pthread_rwlock_t *l) { return pthread_rwlock_unlock(l); }
+#ifdef STARPU_HAVE_PTHREAD_BARRIER
+int starpu_pthread_barrier_wait(starpu_pthread_barrier_t *b) { return pthread_barrier_wait(b); }
+#endif
+
+/* ---- condition variables: sequence word per cond, parked on liblithe's futex ---- */
+#define _STARPU_LITHE_CV_SLOTS 4096
+static struct { void *key; int seq; } _starpu_lithe_cv[_STARPU_LITHE_CV_SLOTS];
+static int *_starpu_lithe_cv_seq(void *cond)
+{
+	uintptr_t h = ((uintptr_t) cond >> 4) * 0x9E3779B97F4A7C15ull;
+	for (unsigned i = 0; i < _STARPU_LITHE_CV_SLOTS; i++)
+	{
+		unsigned k = (unsigned) ((h >> 40) + i) % _STARPU_LITHE_CV_SLOTS;
+		void *cur = __atomic_load_n(&_starpu_lithe_cv[k].key, __ATOMIC_ACQUIRE);
+		if (cur == cond) return &_starpu_lithe_cv[k].seq;
+		if (cur == NULL)
+		{
+			void *exp = NULL;
+			if (__atomic_compare_exchange_n(&_starpu_lithe_cv[k].key, &exp, cond, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || exp == cond)
+				return &_starpu_lithe_cv[k].seq;
+		}
+	}
+	return NULL; /* table full: callers fall back to pthreads */
+}
+static void _starpu_lithe_cv_wake(void *cond, int n)
+{
+	if (!_starpu_lithe_on()) return;
+	int *seq = _starpu_lithe_cv_seq(cond);
+	if (!seq) return;
+	__atomic_add_fetch(seq, 1, __ATOMIC_ACQ_REL);
+	starpu_lithe_futex_wake_some_(seq, n);
+}
+int starpu_pthread_cond_signal(starpu_pthread_cond_t *cond)
+{
+	_starpu_lithe_cv_wake(cond, 1);
+	return pthread_cond_signal(cond);
+}
+int starpu_pthread_cond_broadcast(starpu_pthread_cond_t *cond)
+{
+	_starpu_lithe_cv_wake(cond, 1 << 30);
+	return pthread_cond_broadcast(cond);
+}
+int starpu_pthread_cond_wait(starpu_pthread_cond_t *cond, starpu_pthread_mutex_t *mutex)
+{
+	int *seq;
+	if (!_starpu_lithe_coop() || !(seq = _starpu_lithe_cv_seq(cond)))
+		return pthread_cond_wait(cond, mutex);
+	int v = __atomic_load_n(seq, __ATOMIC_ACQUIRE); /* read under the mutex: a signal after it changes seq */
+	pthread_mutex_unlock(mutex);
+	starpu_lithe_futex_wait_(seq, v);
+	return starpu_pthread_mutex_lock(mutex);
+}
+int starpu_pthread_cond_timedwait(starpu_pthread_cond_t *cond, starpu_pthread_mutex_t *mutex, const struct timespec *abstime)
+{
+	int *seq;
+	if (!_starpu_lithe_coop() || !(seq = _starpu_lithe_cv_seq(cond)))
+		return pthread_cond_timedwait(cond, mutex, abstime);
+	int v = __atomic_load_n(seq, __ATOMIC_ACQUIRE), r = 0;
+	pthread_mutex_unlock(mutex);
+	for (;;)
+	{
+		if (__atomic_load_n(seq, __ATOMIC_ACQUIRE) != v) break;
+		struct timespec now; clock_gettime(CLOCK_REALTIME, &now);
+		if (now.tv_sec > abstime->tv_sec || (now.tv_sec == abstime->tv_sec && now.tv_nsec >= abstime->tv_nsec)) { r = ETIMEDOUT; break; }
+		lithe_context_yield();
+	}
+	starpu_pthread_mutex_lock(mutex);
+	return r;
+}
+#endif /* STARPU_LITHE */

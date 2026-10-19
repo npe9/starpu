@@ -107,10 +107,17 @@ typedef pthread_attr_t starpu_pthread_attr_t;
 
 #define starpu_pthread_equal						  pthread_equal
 #define starpu_pthread_self						  pthread_self
+#if defined(STARPU_LITHE) && defined(BUILDING_STARPU)
+/* Lithe port (lithe-docker 2026-10-19): workers become Lithe contexts (src/common/thread.c). */
+int starpu_pthread_create(starpu_pthread_t *thread, const starpu_pthread_attr_t *attr, void *(*start_routine)(void *), void *arg);
+int starpu_pthread_join(starpu_pthread_t thread, void **retval);
+int starpu_pthread_detach(starpu_pthread_t thread);
+#else
 #define starpu_pthread_create						  pthread_create
-#define starpu_pthread_create_on(name, thread, attr, routine, arg, where) starpu_pthread_create(thread, attr, routine, arg)
 #define starpu_pthread_join						  pthread_join
 #define starpu_pthread_detach						  pthread_detach
+#endif
+#define starpu_pthread_create_on(name, thread, attr, routine, arg, where) starpu_pthread_create(thread, attr, routine, arg)
 #define starpu_pthread_exit						  pthread_exit
 #define starpu_pthread_attr_init					  pthread_attr_init
 #define starpu_pthread_attr_destroy					  pthread_attr_destroy
@@ -165,7 +172,7 @@ typedef pthread_mutexattr_t starpu_pthread_mutexattr_t;
 #define starpu_pthread_mutexattr_destroy pthread_mutexattr_destroy
 #define starpu_pthread_mutexattr_init	 pthread_mutexattr_init
 
-#ifdef STARPU_FXT_LOCK_TRACES
+#if defined(STARPU_FXT_LOCK_TRACES) || (defined(STARPU_LITHE) && defined(BUILDING_STARPU))
 int starpu_pthread_mutex_lock(starpu_pthread_mutex_t *mutex);
 int starpu_pthread_mutex_unlock(starpu_pthread_mutex_t *mutex);
 int starpu_pthread_mutex_trylock(starpu_pthread_mutex_t *mutex);
@@ -236,16 +243,25 @@ typedef pthread_condattr_t starpu_pthread_condattr_t;
 #define STARPU_PTHREAD_COND_INITIALIZER PTHREAD_COND_INITIALIZER
 
 #define starpu_pthread_cond_init      pthread_cond_init
+#if defined(STARPU_LITHE) && defined(BUILDING_STARPU)
+int starpu_pthread_cond_signal(starpu_pthread_cond_t *cond);
+int starpu_pthread_cond_broadcast(starpu_pthread_cond_t *cond);
+#else
 #define starpu_pthread_cond_signal    pthread_cond_signal
 #define starpu_pthread_cond_broadcast pthread_cond_broadcast
+#endif
 
-#ifdef STARPU_FXT_LOCK_TRACES
+#if defined(STARPU_FXT_LOCK_TRACES) || (defined(STARPU_LITHE) && defined(BUILDING_STARPU))
 int starpu_pthread_cond_wait(starpu_pthread_cond_t *cond, starpu_pthread_mutex_t *mutex);
 #else
 #define starpu_pthread_cond_wait pthread_cond_wait
 #endif
 
+#if defined(STARPU_LITHE) && defined(BUILDING_STARPU)
+int starpu_pthread_cond_timedwait(starpu_pthread_cond_t *cond, starpu_pthread_mutex_t *mutex, const struct timespec *abstime);
+#else
 #define starpu_pthread_cond_timedwait pthread_cond_timedwait
+#endif
 #define starpu_pthread_cond_destroy   pthread_cond_destroy
 
 #endif /* STARPU_SIMGRID, _MSC_VER */
@@ -281,7 +297,7 @@ typedef pthread_rwlockattr_t starpu_pthread_rwlockattr_t;
 #define starpu_pthread_rwlock_init    pthread_rwlock_init
 #define starpu_pthread_rwlock_destroy pthread_rwlock_destroy
 
-#ifdef STARPU_FXT_LOCK_TRACES
+#if defined(STARPU_FXT_LOCK_TRACES) || (defined(STARPU_LITHE) && defined(BUILDING_STARPU))
 int starpu_pthread_rwlock_rdlock(starpu_pthread_rwlock_t *rwlock);
 int starpu_pthread_rwlock_tryrdlock(starpu_pthread_rwlock_t *rwlock);
 int starpu_pthread_rwlock_wrlock(starpu_pthread_rwlock_t *rwlock);
@@ -341,7 +357,7 @@ typedef pthread_barrierattr_t starpu_pthread_barrierattr_t;
 #define starpu_pthread_barrier_init    pthread_barrier_init
 #define starpu_pthread_barrier_destroy pthread_barrier_destroy
 
-#ifdef STARPU_FXT_LOCK_TRACES
+#if defined(STARPU_FXT_LOCK_TRACES) || (defined(STARPU_LITHE) && defined(BUILDING_STARPU))
 int starpu_pthread_barrier_wait(starpu_pthread_barrier_t *barrier);
 #else
 #define starpu_pthread_barrier_wait pthread_barrier_wait
