@@ -410,9 +410,15 @@ extern int parlib_reactor_wait(int fd, uint32_t events, int timeout_ms) __attrib
 /* StarPU keeps the last awake worker of a scheduling context polling. Under Lithe a
  * yielding poller stays runnable and takes its turn on every hart that other runtimes
  * need (StarPU + OpenMP in one process: no better than stock with passive OpenMP). When a
- * runnable context has no hart, park the poller briefly instead: a timerfd (STARPU_LITHE_NAP_US, default 50; 0 = yield only) waited on
- * through parlib's reactor. Task pickup is unaffected -- submission wakes the sleeping
- * workers through their condition variables. */
+ * runnable context has no hart, park the poller briefly instead: a timerfd (STARPU_LITHE_NAP_US,
+ * default 0 = yield only) waited on through parlib's reactor. Task pickup is unaffected --
+ * submission wakes the sleeping workers through their condition variables.
+ * 2026-10-19 re-measure (after liblithe's LPT gap gate + aging): the 50 us nap that was the
+ * default now LOSES to plain yielding with an OpenMP co-tenant (window 0.170-0.180 vs
+ * 0.160-0.166 s, 6 reps), so the default is 0. Negative result: parking the poller on a
+ * generation futex woken by task push / starpu_wake_all_blocked_workers (as the PaRSEC and
+ * HPX ports do, where it gained 5 %) changed nothing here (0.160-0.167): with blocking
+ * drivers only this one poller is idle-runnable, and yielding it is already cheap. */
 static __thread int _starpu_lithe_tfd = -1;
 static int _starpu_lithe_nap(void)
 {
@@ -427,7 +433,7 @@ static int _starpu_lithe_nap(void)
 	if (nap_ns < 0)
 	{
 		const char *e = getenv("STARPU_LITHE_NAP_US");
-		nap_ns = (e && *e) ? atol(e) * 1000 : 50000; /* see the sweep in docs/PLAN-alt-runtimes.md */
+		nap_ns = (e && *e) ? atol(e) * 1000 : 0; /* see the sweep in docs/PLAN-alt-runtimes.md */
 		if (nap_ns < 0) nap_ns = 0;
 	}
 	if (nap_ns == 0)
