@@ -46,6 +46,13 @@
 #if defined(STARPU_LINUX_SYS) && defined(STARPU_HAVE_XCHG)
 #include <linux/futex.h>
 #include <sys/syscall.h>
+#if defined(STARPU_LITHE) && !defined(STARPU_FXT_LOCK_TRACES) && !defined(_MSC_VER)
+/* Lithe port helpers, defined with the rest of the port below. */
+static int _starpu_lithe_coop(void);
+extern int starpu_lithe_futex_wait_(int *, int) __asm__("futex_wait") __attribute__((weak));
+extern int starpu_lithe_futex_wake_some_(int *, int) __asm__("futex_wake_some") __attribute__((weak));
+#define _STARPU_SPIN_LITHE 1
+#endif
 
 /* Private futexes are not so old, cope with old kernels.  */
 #ifdef FUTEX_WAIT_PRIVATE
@@ -1052,6 +1059,15 @@ int _starpu_pthread_spin_do_lock(starpu_pthread_spinlock_t *lock)
 		 * - some other thread started blocking, and will set
 		 *   lock->taken back to 2
 		 */
+#ifdef _STARPU_SPIN_LITHE
+		/* Lithe port (2026-10-23): a Lithe context parks on liblithe's futex
+		 * instead of sleeping its hart in the kernel; unlock wakes both. */
+		if (_starpu_lithe_coop())
+		{
+			starpu_lithe_futex_wait_((int *) &lock->taken, 2);
+			continue;
+		}
+#endif
 		if (syscall(SYS_futex, &lock->taken, _starpu_futex_wait, 2, NULL, NULL, 0))
 			if (errno == ENOSYS)
 				_starpu_futex_wait = FUTEX_WAIT;
@@ -1081,6 +1097,10 @@ void _starpu_pthread_spin_do_unlock(starpu_pthread_spinlock_t *lock)
 	 */
 	lock->taken = 0;
 	STARPU_SYNCHRONIZE();
+#ifdef _STARPU_SPIN_LITHE
+	if (starpu_lithe_futex_wake_some_)
+		starpu_lithe_futex_wake_some_((int *) &lock->taken, 1);
+#endif
 	if (syscall(SYS_futex, &lock->taken, _starpu_futex_wake, 1, NULL, NULL, 0) == -1)
 		switch (errno)
 		{
@@ -1248,6 +1268,15 @@ static int _starpu_lithe_on(void)
 	return on;
 }
 /* The caller is a Lithe context that may yield or park. */
+static int _starpu_lithe_coop(void);
+void _starpu_lithe_uyield(void)
+{
+	static __thread unsigned n;
+	_STARPU_UYIELD();
+	if ((++n & 15) == 0 && _starpu_lithe_coop())
+		lithe_context_yield();
+}
+
 static int _starpu_lithe_coop(void)
 {
 	return _starpu_lithe_on() && lithe_can_block();
@@ -1344,7 +1373,78 @@ int starpu_pthread_rwlock_tryrdlock(starpu_pthread_rwlock_t *l) { return pthread
 int starpu_pthread_rwlock_trywrlock(starpu_pthread_rwlock_t *l) { return pthread_rwlock_trywrlock(l); }
 int starpu_pthread_rwlock_unlock(starpu_pthread_rwlock_t *l) { return pthread_rwlock_unlock(l); }
 #ifdef STARPU_HAVE_PTHREAD_BARRIER
-int starpu_pthread_barrier_wait(starpu_pthread_barrier_t *b) { return pthread_barrier_wait(b); }
+/* ---- barrier: generation word parked on liblithe's futex (2026-10-23) ----
+ * pthread_barrier_wait slept the hart in the kernel: a combined-worker
+ * (parallel) task's members on fewer harts than members never all arrived.
+ * When the port is on, every waiter uses this barrier: a Lithe context parks on
+ * liblithe's futex, anything else on the kernel futex; the last arriver bumps
+ * the generation and wakes both. State lives in a side table keyed by address
+ * (the pthread type stays for the stock path). */
+#define _STARPU_LITHE_BAR_SLOTS 256
+static struct { void *key; unsigned count; unsigned arrived; int gen; int kwait; } _starpu_lithe_bar[_STARPU_LITHE_BAR_SLOTS];
+static int _starpu_lithe_bar_slot(void *b, int create)
+{
+	uintptr_t h = ((uintptr_t) b >> 4) * 0x9E3779B97F4A7C15ull;
+	for (unsigned i = 0; i < _STARPU_LITHE_BAR_SLOTS; i++)
+	{
+		unsigned k = (unsigned) ((h >> 40) + i) % _STARPU_LITHE_BAR_SLOTS;
+		void *cur = __atomic_load_n(&_starpu_lithe_bar[k].key, __ATOMIC_ACQUIRE);
+		if (cur == b) return (int) k;
+		if (cur == NULL)
+		{
+			if (!create) return -1;
+			void *z = NULL;
+			if (__atomic_compare_exchange_n(&_starpu_lithe_bar[k].key, &z, b, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+				return (int) k;
+			if (z == b) return (int) k;
+		}
+	}
+	return -1;
+}
+int starpu_pthread_barrier_init(starpu_pthread_barrier_t *b, const starpu_pthread_barrierattr_t *attr, unsigned count)
+{
+	int k = _starpu_lithe_on() ? _starpu_lithe_bar_slot(b, 1) : -1;
+	if (k >= 0)
+	{
+		_starpu_lithe_bar[k].count = count;
+		__atomic_store_n(&_starpu_lithe_bar[k].arrived, 0, __ATOMIC_RELEASE);
+	}
+	return pthread_barrier_init(b, attr, count);
+}
+int starpu_pthread_barrier_destroy(starpu_pthread_barrier_t *b)
+{
+	int k = _starpu_lithe_bar_slot(b, 0);
+	if (k >= 0)
+		__atomic_store_n(&_starpu_lithe_bar[k].key, NULL, __ATOMIC_RELEASE);
+	return pthread_barrier_destroy(b);
+}
+int starpu_pthread_barrier_wait(starpu_pthread_barrier_t *b)
+{
+	int k = _starpu_lithe_bar_slot(b, 0);
+	if (k < 0) return pthread_barrier_wait(b);   /* port off, or table full at init */
+	int g = __atomic_load_n(&_starpu_lithe_bar[k].gen, __ATOMIC_ACQUIRE);
+	if (__atomic_add_fetch(&_starpu_lithe_bar[k].arrived, 1, __ATOMIC_ACQ_REL) == _starpu_lithe_bar[k].count)
+	{
+		__atomic_store_n(&_starpu_lithe_bar[k].arrived, 0, __ATOMIC_RELAXED);
+		__atomic_add_fetch(&_starpu_lithe_bar[k].gen, 1, __ATOMIC_ACQ_REL);
+		starpu_lithe_futex_wake_some_(&_starpu_lithe_bar[k].gen, 1 << 30);
+		if (__atomic_load_n(&_starpu_lithe_bar[k].kwait, __ATOMIC_ACQUIRE) > 0)
+			syscall(SYS_futex, &_starpu_lithe_bar[k].gen, FUTEX_WAKE_PRIVATE, 1 << 30, NULL, NULL, 0);
+		return PTHREAD_BARRIER_SERIAL_THREAD;
+	}
+	while (__atomic_load_n(&_starpu_lithe_bar[k].gen, __ATOMIC_ACQUIRE) == g)
+	{
+		if (_starpu_lithe_coop())
+			starpu_lithe_futex_wait_(&_starpu_lithe_bar[k].gen, g);
+		else
+		{
+			__atomic_add_fetch(&_starpu_lithe_bar[k].kwait, 1, __ATOMIC_ACQ_REL);
+			syscall(SYS_futex, &_starpu_lithe_bar[k].gen, FUTEX_WAIT_PRIVATE, g, NULL, NULL, 0);
+			__atomic_sub_fetch(&_starpu_lithe_bar[k].kwait, 1, __ATOMIC_ACQ_REL);
+		}
+	}
+	return 0;
+}
 #endif
 
 /* ---- condition variables: sequence word per cond, parked on liblithe's futex ---- */

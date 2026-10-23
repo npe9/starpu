@@ -100,6 +100,14 @@ extern "C" {
 #define STARPU_VALGRIND_YIELD() do { } while (0)
 #define STARPU_UYIELD() _STARPU_UYIELD()
 #endif
+#if defined(STARPU_LITHE) && !defined(STARPU_SIMGRID) && !defined(_MSC_VER)
+/* Lithe port: busy-wait loops (spinlock spin, driver_cpu, jobs, datawizard) hand
+ * the hart to runnable contexts every few spins instead of holding it with
+ * pause instructions (src/common/thread.c). */
+void _starpu_lithe_uyield(void);
+#undef STARPU_UYIELD
+#define STARPU_UYIELD() _starpu_lithe_uyield()
+#endif
 
 #ifdef STARPU_RECURSIVE_TASKS_VERBOSE
 #  define _STARPU_RECURSIVE_TASKS_DEBUG(fmt, ...) do { if (!_starpu_silent) {fprintf(stderr, STARPU_DEBUG_PREFIX"[%s] " fmt ,__starpu_func__ ,## __VA_ARGS__); fflush(stderr); }} while(0)

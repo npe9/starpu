@@ -354,8 +354,14 @@ int starpu_pthread_barrier_wait(starpu_pthread_barrier_t *barrier);
 typedef pthread_barrier_t starpu_pthread_barrier_t;
 typedef pthread_barrierattr_t starpu_pthread_barrierattr_t;
 
+#if defined(STARPU_LITHE) && defined(BUILDING_STARPU)
+/* Lithe port: the barrier parks on a futex word (thread.c), so it needs the count */
+int starpu_pthread_barrier_init(starpu_pthread_barrier_t *barrier, const starpu_pthread_barrierattr_t *attr, unsigned count);
+int starpu_pthread_barrier_destroy(starpu_pthread_barrier_t *barrier);
+#else
 #define starpu_pthread_barrier_init    pthread_barrier_init
 #define starpu_pthread_barrier_destroy pthread_barrier_destroy
+#endif
 
 #if defined(STARPU_FXT_LOCK_TRACES) || (defined(STARPU_LITHE) && defined(BUILDING_STARPU))
 int starpu_pthread_barrier_wait(starpu_pthread_barrier_t *barrier);
