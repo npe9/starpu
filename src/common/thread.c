@@ -1347,31 +1347,202 @@ int starpu_pthread_detach(starpu_pthread_t thread)
 	return 0;
 }
 
-/* ---- mutexes and rwlocks: try, then yield the context ---- */
+/* ---- mutexes and rwlocks: try, then yield the context ----
+ * De-spin (STARPU_LITHE_NOSPIN_MUTEX=1, default off; DESPIN_RULES.md rule 4): the try+yield loop is
+ * a yield spin, and StarPU's critical sections take further locks (scheduler pops/pushes under
+ * sched_mutex), so a holder can itself be waiting. With the gate a contended Lithe context parks
+ * on a per-lock sequence word (side table keyed by address, as the condition variables below);
+ * unlock bumps it and wakes one (rwlock: all) only while a Lithe waiter is registered anywhere
+ * (one load otherwise). Kernel-thread waiters still block inside pthreads and are woken by it.
+ * Default OFF: neutral to slightly worse (r3.csv, n=10: blocking drivers with a serial gap, StarPU
+ * alone 0.3390 -> 0.3436, + OpenMP 0.3615 -> 0.3666; mix cells parity). The critical sections are
+ * short and their holders run (rule 4), and the 1 ms safety timeout bounds a missed unlock. */
+extern int starpu_lithe_futex_wait_timeout_(int *, int, const struct timespec *) __asm__("futex_wait_timeout") __attribute__((weak));
+static int _starpu_lithe_nospin_mutex(void)
+{
+	static int on = -1;
+	if (on < 0) { const char *e = getenv("STARPU_LITHE_NOSPIN_MUTEX"); on = (e && e[0] == '1'); }
+	return on;
+}
+#define _STARPU_LITHE_MX_SLOTS 4096
+static struct { void *key; int seq; int nwait; } _starpu_lithe_mx[_STARPU_LITHE_MX_SLOTS];
+static int _starpu_lithe_mx_waiters; /* Lithe waiters registered on any lock */
+static int _starpu_lithe_mx_slot(void *m, int create)
+{
+	uintptr_t h = ((uintptr_t) m >> 4) * 0x9E3779B97F4A7C15ull;
+	for (unsigned i = 0; i < _STARPU_LITHE_MX_SLOTS; i++)
+	{
+		unsigned k = (unsigned) ((h >> 40) + i) % _STARPU_LITHE_MX_SLOTS;
+		void *cur = __atomic_load_n(&_starpu_lithe_mx[k].key, __ATOMIC_ACQUIRE);
+		if (cur == m) return (int) k;
+		if (cur == NULL)
+		{
+			if (!create) return -1;
+			void *z = NULL;
+			if (__atomic_compare_exchange_n(&_starpu_lithe_mx[k].key, &z, m, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE) || z == m)
+				return (int) k;
+		}
+	}
+	return -1;
+}
+/* Park until try() succeeds. Returns try()'s result, or -1 if the table is full (caller yields). */
+static int _starpu_lithe_mx_park(void *m, int (*try)(void *))
+{
+	int k = _starpu_lithe_mx_slot(m, 1), r;
+	if (k < 0) return -1;
+	for (;;)
+	{
+		int v = __atomic_load_n(&_starpu_lithe_mx[k].seq, __ATOMIC_SEQ_CST);
+		__atomic_add_fetch(&_starpu_lithe_mx[k].nwait, 1, __ATOMIC_SEQ_CST);
+		__atomic_add_fetch(&_starpu_lithe_mx_waiters, 1, __ATOMIC_SEQ_CST);
+		if ((r = try(m)) != EBUSY)
+		{
+			__atomic_sub_fetch(&_starpu_lithe_mx_waiters, 1, __ATOMIC_SEQ_CST);
+			__atomic_sub_fetch(&_starpu_lithe_mx[k].nwait, 1, __ATOMIC_SEQ_CST);
+			return r;
+		}
+		/* bounded park: an unlock StarPU did not route through starpu_pthread_mutex_unlock (a
+		 * kernel thread's pthread_cond_wait releases the mutex inside glibc) would not wake us */
+		if (starpu_lithe_futex_wait_timeout_)
+		{
+			struct timespec tmo = { 0, 1000000 };
+			starpu_lithe_futex_wait_timeout_(&_starpu_lithe_mx[k].seq, v, &tmo);
+		}
+		else
+			starpu_lithe_futex_wait_(&_starpu_lithe_mx[k].seq, v);
+		__atomic_sub_fetch(&_starpu_lithe_mx_waiters, 1, __ATOMIC_SEQ_CST);
+		__atomic_sub_fetch(&_starpu_lithe_mx[k].nwait, 1, __ATOMIC_SEQ_CST);
+	}
+}
+static void _starpu_lithe_mx_wake(void *m, int n)
+{
+	__atomic_thread_fence(__ATOMIC_SEQ_CST); /* the unlock before the waiter-count load */
+	if (__atomic_load_n(&_starpu_lithe_mx_waiters, __ATOMIC_SEQ_CST) == 0) return;
+	int k = _starpu_lithe_mx_slot(m, 0);
+	if (k < 0 || __atomic_load_n(&_starpu_lithe_mx[k].nwait, __ATOMIC_SEQ_CST) == 0) return;
+	__atomic_add_fetch(&_starpu_lithe_mx[k].seq, 1, __ATOMIC_SEQ_CST);
+	starpu_lithe_futex_wake_some_(&_starpu_lithe_mx[k].seq, n);
+}
+static int _starpu_lithe_try_mutex(void *m) { return pthread_mutex_trylock((pthread_mutex_t *) m); }
+static int _starpu_lithe_try_rd(void *l) { return pthread_rwlock_tryrdlock((pthread_rwlock_t *) l); }
+static int _starpu_lithe_try_wr(void *l) { return pthread_rwlock_trywrlock((pthread_rwlock_t *) l); }
 int starpu_pthread_mutex_lock(starpu_pthread_mutex_t *mutex)
 {
 	if (!_starpu_lithe_coop())
 		return pthread_mutex_lock(mutex);
 	int r;
+	if ((r = pthread_mutex_trylock(mutex)) != EBUSY) return r;
+	if (_starpu_lithe_nospin_mutex() && (r = _starpu_lithe_mx_park(mutex, _starpu_lithe_try_mutex)) >= 0) return r;
 	while ((r = pthread_mutex_trylock(mutex)) == EBUSY)
 		lithe_context_yield();
 	return r;
 }
-int starpu_pthread_mutex_unlock(starpu_pthread_mutex_t *mutex) { return pthread_mutex_unlock(mutex); }
+int starpu_pthread_mutex_unlock(starpu_pthread_mutex_t *mutex)
+{
+	int r = pthread_mutex_unlock(mutex);
+	if (_starpu_lithe_nospin_mutex()) _starpu_lithe_mx_wake(mutex, 1);
+	return r;
+}
 int starpu_pthread_mutex_trylock(starpu_pthread_mutex_t *mutex) { return pthread_mutex_trylock(mutex); }
 int starpu_pthread_rwlock_rdlock(starpu_pthread_rwlock_t *l)
 {
 	if (!_starpu_lithe_coop()) return pthread_rwlock_rdlock(l);
-	int r; while ((r = pthread_rwlock_tryrdlock(l)) == EBUSY) lithe_context_yield(); return r;
+	int r;
+	if ((r = pthread_rwlock_tryrdlock(l)) != EBUSY) return r;
+	if (_starpu_lithe_nospin_mutex() && (r = _starpu_lithe_mx_park(l, _starpu_lithe_try_rd)) >= 0) return r;
+	while ((r = pthread_rwlock_tryrdlock(l)) == EBUSY) lithe_context_yield(); return r;
 }
 int starpu_pthread_rwlock_wrlock(starpu_pthread_rwlock_t *l)
 {
 	if (!_starpu_lithe_coop()) return pthread_rwlock_wrlock(l);
-	int r; while ((r = pthread_rwlock_trywrlock(l)) == EBUSY) lithe_context_yield(); return r;
+	int r;
+	if ((r = pthread_rwlock_trywrlock(l)) != EBUSY) return r;
+	if (_starpu_lithe_nospin_mutex() && (r = _starpu_lithe_mx_park(l, _starpu_lithe_try_wr)) >= 0) return r;
+	while ((r = pthread_rwlock_trywrlock(l)) == EBUSY) lithe_context_yield(); return r;
 }
 int starpu_pthread_rwlock_tryrdlock(starpu_pthread_rwlock_t *l) { return pthread_rwlock_tryrdlock(l); }
 int starpu_pthread_rwlock_trywrlock(starpu_pthread_rwlock_t *l) { return pthread_rwlock_trywrlock(l); }
-int starpu_pthread_rwlock_unlock(starpu_pthread_rwlock_t *l) { return pthread_rwlock_unlock(l); }
+int starpu_pthread_rwlock_unlock(starpu_pthread_rwlock_t *l)
+{
+	int r = pthread_rwlock_unlock(l);
+	if (_starpu_lithe_nospin_mutex()) _starpu_lithe_mx_wake(l, 1 << 30);
+	return r;
+}
+
+/* ---- idle workers (STARPU_LITHE_NOSPIN_IDLE, DEFAULT ON, =0 off; DESPIN_RULES.md class I) ----
+ * A worker that finds no task backs off with one Lithe yield per pass (driver_common.c), so it
+ * stays runnable and polls: every worker with the non-blocking drivers, the last awake worker of
+ * each scheduling context with the blocking ones. With the gate it parks on a work generation
+ * after STARPU_LITHE_PARK_AFTER (default 1) empty passes. The generation is snapshotted before
+ * the pop (_starpu_lithe_idle_mark, top of _starpu_get_worker_task) and bumped after every
+ * enqueue (_starpu_push_task_to_workers, _starpu_push_local_task), every explicit worker wake-up
+ * (starpu_wakeup_worker_locked: keep-awake), every block/unblock-in-parallel request, and
+ * starpu_wake_all_blocked_workers (shutdown), seq_cst on both sides, so a worker parks only while
+ * nothing it polls for changed since its pop. The park re-checks that the machine still runs
+ * after registering. Bumping on EVERY condition signal instead never let a worker sleep: each
+ * poll pass broadcasts its own sched_cond (leave_sched_op, the relax protocol of stealers), so
+ * the pollers kept moving each other's generation (stats: 0 sleeps, 1.2 M skipped parks / run),
+ * and since a skipped park also skips that pass's yield it was a pure spin: the polled-driver mix
+ * ran 6 % slower (.build_logs/despin/tasks/starpu/ab.csv, superseded).
+ * A/B with the explicit wakes (2026-10-24, .build_logs/despin/tasks/starpu/r3.csv, cores 8-11,
+ * 4 harts, n=10 interleaved per cell, 0 failures; medians, base -> PARK_AFTER=16 [-> 1]):
+ *   polled drivers  StarPU alone 0.0747 -> 0.0744 [0.0759]; + OpenMP window 0.1478 -> 0.1445 [0.1399]
+ *                   serial gap per round: alone 0.3310 -> 0.3310; OpenMP tenant 0.160 -> 0.132 [0.132]
+ *   blocking        alone 0.0804 -> 0.0805 [0.0811]; + OpenMP 0.1440 -> 0.1433 [0.1426]
+ *                   gap: alone 0.3390 -> 0.3383; OpenMP tenant 0.1338 -> 0.1321
+ * Default on with STARPU_LITHE_PARK_AFTER=16: parity-or-better in every cell; 1 wins more with a
+ * co-tenant but costs 1-2 % alone (a wake per round). STARPU_LITHE_NOSPIN_STATS=1 counts parks
+ * (starpu_lithe_nospin_stats_print). */
+static int _starpu_lithe_gen, _starpu_lithe_nparked;
+/* STARPU_LITHE_NOSPIN_STATS=1: count parks (slept / returned at once) and wakes, print at exit */
+static unsigned long _starpu_lithe_st_slept, _starpu_lithe_st_skipped, _starpu_lithe_st_bumps, _starpu_lithe_st_wakes;
+static int _starpu_lithe_stats(void)
+{
+	static int on = -1;
+	if (on < 0) { const char *e = getenv("STARPU_LITHE_NOSPIN_STATS"); on = (e && e[0] == '1'); }
+	return on;
+}
+void starpu_lithe_nospin_stats_print(void);
+void starpu_lithe_nospin_stats_print(void)
+{
+	if (_starpu_lithe_stats())
+		fprintf(stderr, "STARPU_LITHE_NOSPIN_STATS slept=%lu skipped=%lu bumps=%lu wakes=%lu\n",
+			_starpu_lithe_st_slept, _starpu_lithe_st_skipped, _starpu_lithe_st_bumps, _starpu_lithe_st_wakes);
+}
+int _starpu_lithe_nospin_idle(void)
+{
+	static int on = -1;
+	if (on < 0) { const char *e = getenv("STARPU_LITHE_NOSPIN_IDLE"); on = !(e && e[0] == '0') && _starpu_lithe_on(); }
+	return on;
+}
+int _starpu_lithe_idle_mark(void)
+{
+	return _starpu_lithe_nospin_idle() ? __atomic_load_n(&_starpu_lithe_gen, __ATOMIC_SEQ_CST) : 0;
+}
+int _starpu_lithe_idle_park(int snap, int (*still_running)(void))
+{
+	if (!_starpu_lithe_nospin_idle() || !_starpu_lithe_coop()) return 0;
+	__atomic_add_fetch(&_starpu_lithe_nparked, 1, __ATOMIC_SEQ_CST);
+	if (__atomic_load_n(&_starpu_lithe_gen, __ATOMIC_SEQ_CST) == snap && (!still_running || still_running()))
+	{
+		if (_starpu_lithe_stats()) __atomic_add_fetch(&_starpu_lithe_st_slept, 1, __ATOMIC_RELAXED);
+		starpu_lithe_futex_wait_(&_starpu_lithe_gen, snap);
+	}
+	else if (_starpu_lithe_stats()) __atomic_add_fetch(&_starpu_lithe_st_skipped, 1, __ATOMIC_RELAXED);
+	__atomic_sub_fetch(&_starpu_lithe_nparked, 1, __ATOMIC_SEQ_CST);
+	return 1;
+}
+void _starpu_lithe_work_ready(void)
+{
+	if (!_starpu_lithe_nospin_idle()) return;
+	__atomic_add_fetch(&_starpu_lithe_gen, 1, __ATOMIC_SEQ_CST);
+	if (_starpu_lithe_stats()) __atomic_add_fetch(&_starpu_lithe_st_bumps, 1, __ATOMIC_RELAXED);
+	if (__atomic_load_n(&_starpu_lithe_nparked, __ATOMIC_SEQ_CST) > 0)
+	{
+		if (_starpu_lithe_stats()) __atomic_add_fetch(&_starpu_lithe_st_wakes, 1, __ATOMIC_RELAXED);
+		starpu_lithe_futex_wake_some_(&_starpu_lithe_gen, 1 << 30);
+	}
+}
 #ifdef STARPU_HAVE_PTHREAD_BARRIER
 /* ---- barrier: generation word parked on liblithe's futex (2026-10-23) ----
  * pthread_barrier_wait slept the hart in the kernel: a combined-worker
@@ -1491,7 +1662,7 @@ int starpu_pthread_cond_wait(starpu_pthread_cond_t *cond, starpu_pthread_mutex_t
 	if (!_starpu_lithe_coop() || !(seq = _starpu_lithe_cv_seq(cond)))
 		return pthread_cond_wait(cond, mutex);
 	int v = __atomic_load_n(seq, __ATOMIC_ACQUIRE); /* read under the mutex: a signal after it changes seq */
-	pthread_mutex_unlock(mutex);
+	starpu_pthread_mutex_unlock(mutex); /* wakes NOSPIN_MUTEX waiters */
 	starpu_lithe_futex_wait_(seq, v);
 	return starpu_pthread_mutex_lock(mutex);
 }
@@ -1501,7 +1672,7 @@ int starpu_pthread_cond_timedwait(starpu_pthread_cond_t *cond, starpu_pthread_mu
 	if (!_starpu_lithe_coop() || !(seq = _starpu_lithe_cv_seq(cond)))
 		return pthread_cond_timedwait(cond, mutex, abstime);
 	int v = __atomic_load_n(seq, __ATOMIC_ACQUIRE), r = 0;
-	pthread_mutex_unlock(mutex);
+	starpu_pthread_mutex_unlock(mutex); /* wakes NOSPIN_MUTEX waiters */
 	for (;;)
 	{
 		if (__atomic_load_n(seq, __ATOMIC_ACQUIRE) != v) break;

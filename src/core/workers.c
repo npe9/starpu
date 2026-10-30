@@ -2871,11 +2871,17 @@ static int starpu_wakeup_worker_locked(int workerid, starpu_pthread_cond_t *sche
 		/* cond_broadcast is required over cond_signal since
 		 * the condition is share for multiple purpose */
 		STARPU_PTHREAD_COND_BROADCAST(sched_cond);
+#if defined(STARPU_LITHE) && !defined(STARPU_SIMGRID) && !defined(_MSC_VER)
+		_starpu_lithe_work_ready(); /* de-spin NOSPIN_IDLE: a worker parked on the work generation */
+#endif
 		return ret;
 	}
 	else if (_starpu_config.workers[workerid].status & STATUS_SCHEDULING)
 	{
 		_starpu_config.workers[workerid].state_keep_awake = 1;
+#if defined(STARPU_LITHE) && !defined(STARPU_SIMGRID) && !defined(_MSC_VER)
+		_starpu_lithe_work_ready(); /* de-spin NOSPIN_IDLE: a worker parked on the work generation */
+#endif
 		return 0;
 	}
 	return 0;

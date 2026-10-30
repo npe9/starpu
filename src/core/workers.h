@@ -864,6 +864,9 @@ static inline void _starpu_worker_request_blocking_in_parallel(struct _starpu_wo
 		/* trigger the block_in_parallel_req */
 		worker->state_block_in_parallel_req = 1;
 		STARPU_PTHREAD_COND_BROADCAST(&worker->sched_cond);
+#if defined(STARPU_LITHE) && !defined(STARPU_SIMGRID) && !defined(_MSC_VER)
+		_starpu_lithe_work_ready(); /* de-spin NOSPIN_IDLE: a worker parked on the work generation */
+#endif
 #ifdef STARPU_SIMGRID
 		starpu_pthread_queue_broadcast(&_starpu_simgrid_task_queue[worker->workerid]);
 #endif
@@ -911,6 +914,9 @@ static inline void _starpu_worker_request_unblocking_in_parallel(struct _starpu_
 			/* trigger the unblock_in_parallel_req */
 			worker->state_unblock_in_parallel_req = 1;
 			STARPU_PTHREAD_COND_BROADCAST(&worker->sched_cond);
+#if defined(STARPU_LITHE) && !defined(STARPU_SIMGRID) && !defined(_MSC_VER)
+		_starpu_lithe_work_ready(); /* de-spin NOSPIN_IDLE: a worker parked on the work generation */
+#endif
 
 			/* wait for the unblock_in_parallel_req to be processed */
 			while (!worker->state_unblock_in_parallel_ack)

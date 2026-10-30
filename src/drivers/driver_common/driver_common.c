@@ -418,8 +418,19 @@ extern int parlib_reactor_wait(int fd, uint32_t events, int timeout_ms) __attrib
  * 0.160-0.166 s, 6 reps), so the default is 0. Negative result: parking the poller on a
  * generation futex woken by task push / starpu_wake_all_blocked_workers (as the PaRSEC and
  * HPX ports do, where it gained 5 %) changed nothing here (0.160-0.167): with blocking
- * drivers only this one poller is idle-runnable, and yielding it is already cheap. */
+ * drivers only this one poller is idle-runnable, and yielding it is already cheap.
+ * 2026-10-24 (de-spin): that holds for the back-to-back mix, but with a serial gap per round the
+ * polled-driver pollers cost the OpenMP tenant 0.160 vs 0.132 s; the generation park is now on by
+ * default after 16 empty passes (STARPU_LITHE_NOSPIN_IDLE, numbers in src/common/thread.c). */
 static __thread int _starpu_lithe_tfd = -1;
+static __thread int _starpu_lithe_snap, _starpu_lithe_misses;
+static int _starpu_lithe_park_after(void)
+{
+	static int n = -1;
+	if (n < 0) { const char *e = getenv("STARPU_LITHE_PARK_AFTER"); n = e ? atoi(e) : 16; if (n < 1) n = 1; } /* thread.c */
+	return n;
+}
+static int _starpu_lithe_running(void) { return _starpu_machine_is_running(); }
 static int _starpu_lithe_nap(void)
 {
 	if (!parlib_reactor_wait || !lithe_fork_join_current_hartless_runnable
@@ -459,6 +470,10 @@ static void _starpu_exponential_backoff(struct _starpu_worker *worker)
 	 * caller loops. */
 	if (lithe_can_block && lithe_context_yield && lithe_can_block() && !getenv("STARPU_LITHE_DISABLE"))
 	{
+		/* De-spin (STARPU_LITHE_NOSPIN_IDLE, src/common/thread.c): park instead of yielding */
+		if (_starpu_lithe_nospin_idle() && ++_starpu_lithe_misses >= _starpu_lithe_park_after()
+		    && _starpu_lithe_idle_park(_starpu_lithe_snap, _starpu_lithe_running))
+			return;
 		if (!_starpu_lithe_nap())
 			lithe_context_yield();
 		return;
@@ -498,6 +513,9 @@ struct starpu_task *_starpu_get_worker_task(struct _starpu_worker *worker, int w
 	unsigned keep_awake = 0;
 #endif
 
+#if defined(STARPU_LITHE) && !defined(STARPU_SIMGRID)
+	_starpu_lithe_snap = _starpu_lithe_idle_mark(); /* before the pop: see thread.c NOSPIN_IDLE */
+#endif
 	STARPU_PTHREAD_MUTEX_LOCK_SCHED(&worker->sched_mutex);
 	_starpu_worker_enter_sched_op(worker);
 	_starpu_worker_set_status_scheduling(workerid);
@@ -610,6 +628,9 @@ struct starpu_task *_starpu_get_worker_task(struct _starpu_worker *worker, int w
 		_starpu_worker_set_status_sleeping(workerid);
 	}
 	worker->spinning_backoff = worker->config->conf.driver_spinning_backoff_min;
+#if defined(STARPU_LITHE) && !defined(STARPU_SIMGRID)
+	if (task) _starpu_lithe_misses = 0;
+#endif
 
 	_starpu_worker_leave_sched_op(worker);
 	STARPU_PTHREAD_MUTEX_UNLOCK_SCHED(&worker->sched_mutex);

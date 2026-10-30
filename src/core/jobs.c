@@ -998,7 +998,16 @@ struct starpu_task *_starpu_pop_local_task(struct _starpu_worker *worker)
 	return task;
 }
 
+static int __starpu_push_local_task(struct _starpu_worker *worker, struct starpu_task *task);
 int _starpu_push_local_task(struct _starpu_worker *worker, struct starpu_task *task)
+{
+	int ret = __starpu_push_local_task(worker, task);
+#if defined(STARPU_LITHE) && !defined(STARPU_SIMGRID) && !defined(_MSC_VER)
+	_starpu_lithe_work_ready(); /* de-spin NOSPIN_IDLE: after the enqueue (src/common/thread.c) */
+#endif
+	return ret;
+}
+static int __starpu_push_local_task(struct _starpu_worker *worker, struct starpu_task *task)
 {
 	/* Check that the worker is able to execute the task ! */
 	STARPU_ASSERT(task && task->cl);

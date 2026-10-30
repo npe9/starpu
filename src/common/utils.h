@@ -105,6 +105,12 @@ extern "C" {
  * the hart to runnable contexts every few spins instead of holding it with
  * pause instructions (src/common/thread.c). */
 void _starpu_lithe_uyield(void);
+/* De-spin (DESPIN_RULES.md, 2026-10-24; src/common/thread.c): STARPU_LITHE_NOSPIN_IDLE (default on)
+ * parks idle polling workers on a work generation; task pushes and explicit wakes bump it. */
+int _starpu_lithe_nospin_idle(void);
+int _starpu_lithe_idle_mark(void);
+int _starpu_lithe_idle_park(int snap, int (*still_running)(void));
+void _starpu_lithe_work_ready(void);
 #undef STARPU_UYIELD
 #define STARPU_UYIELD() _starpu_lithe_uyield()
 #endif

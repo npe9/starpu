@@ -84,6 +84,10 @@ void _starpu_wake_all_blocked_workers_on_node(unsigned nodeid)
 
 void starpu_wake_all_blocked_workers(void)
 {
+#if defined(STARPU_LITHE) && !defined(STARPU_SIMGRID) && !defined(_MSC_VER)
+	_starpu_lithe_work_ready(); /* de-spin NOSPIN_IDLE: a worker parked on the work generation */
+#endif
+
 	/* workers may be blocked on the various queues' conditions */
 	struct _starpu_memory_node_descr * const descr = _starpu_memory_node_get_description();
 	const int cur_workerid = starpu_worker_get_id();

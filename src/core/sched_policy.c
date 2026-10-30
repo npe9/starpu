@@ -732,7 +732,16 @@ int _starpu_repush_task(struct _starpu_job *j)
 	return ret;
 }
 
+static int __starpu_push_task_to_workers(struct starpu_task *task);
 int _starpu_push_task_to_workers(struct starpu_task *task)
+{
+	int ret = __starpu_push_task_to_workers(task);
+#if defined(STARPU_LITHE) && !defined(STARPU_SIMGRID) && !defined(_MSC_VER)
+	_starpu_lithe_work_ready(); /* de-spin NOSPIN_IDLE: after the enqueue (src/common/thread.c) */
+#endif
+	return ret;
+}
+static int __starpu_push_task_to_workers(struct starpu_task *task)
 {
 	struct _starpu_sched_ctx *sched_ctx = _starpu_get_sched_ctx_struct(task->sched_ctx);
 
